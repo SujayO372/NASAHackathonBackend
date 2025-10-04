@@ -1,61 +1,17 @@
-# main.py - Weather AI Backend
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import os
 import glob
-from typing import Tuple, List, Dict, Any, Optional
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
-import warnings
 
-warnings.filterwarnings('ignore')
-
-# ------------------ Global Model Training (Using NasaWeatherPred.csv) ------------------
-GLOBAL_RF_MODEL = None
-GLOBAL_LABEL_ENCODER = None
-GLOBAL_MODEL_READY = False
-
-# Features used for training (must match the NASA data columns exactly)
-TRAINING_FEATURES = ["Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)"]
-
-try:
-    print("--- Loading NASA Training Data and Training Model ---")
-    # CRITICAL ASSUMPTION: NasaWeatherPred.csv must contain columns:
-    # "Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)", and "Weather Type"
-    NASA_DF = pd.read_csv("NasaWeatherPred.csv")
-
-    # X and Y definitions based on the provided dataset snippet
-    X_train_nasa = NASA_DF[TRAINING_FEATURES]
-    y_train_nasa = NASA_DF["Weather Type"]
-
-    GLOBAL_LABEL_ENCODER = LabelEncoder()
-    y_encoded_nasa = GLOBAL_LABEL_ENCODER.fit_transform(y_train_nasa)
-
-    GLOBAL_RF_MODEL = RandomForestClassifier(n_estimators=100, random_state=42)
-    GLOBAL_RF_MODEL.fit(X_train_nasa, y_encoded_nasa)
-    GLOBAL_MODEL_READY = True
-    print(f"--- Global Model Trained on {len(NASA_DF)} samples ---")
-    print(f"--- Model predicting: {list(GLOBAL_LABEL_ENCODER.classes_)} ---")
-except FileNotFoundError:
-    print("--- ERROR: NasaWeatherPred.csv not found. Model not trained. ---")
-except KeyError as e:
-    print(f"--- ERROR: Missing required column in NasaWeatherPred.csv: {e} ---")
-except Exception as e:
-    print(f"--- ERROR: Could not load/train model on NasaWeatherPred.csv: {e} ---")
-finally:
-    if not GLOBAL_MODEL_READY:
-        print("--- API will return 'Model Error' until NASA data is available and valid. ---")
-
-# ------------------ Config ------------------
+# --- GLOBAL CONSTANTS ---
 GEOCODING_API_URL = "https://geocoding-api.open-meteo.com/v1/search"
 ARCHIVE_API_URL = "https://archive-api.open-meteo.com/v1/archive"
+NASA_FILENAME = "NasaWeatherPred.csv"
 
-# These variables are still needed to fetch the *input features* (the means)
 HOURLY_VARIABLES = [
     "temperature_2m",
     "pressure_msl",
@@ -66,61 +22,96 @@ HOURLY_VARIABLES = [
     "precipitation"
 ]
 
-# ------------------ FastAPI ------------------
-app = FastAPI(title="Weather-AI Backend", version="1.0")
-
-# Enhanced CORS for local development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Global variables to store the pre-trained model and encoder
+NASA_MODEL = None
+NASA_LABEL_ENCODER = None
 
 
-# ------------------ Request Schemas ------------------
-class DayRequest(BaseModel):
-    city: str
-    state: str
-    date: str  # YYYY-MM-DD
+# --- NEW FUNCTION: Train the model on the NASA CSV ---
+def train_nasa_model():
+    """Loads NASA data, trains a RandomForestClassifier, and stores it globally."""
+    global NASA_MODEL, NASA_LABEL_ENCODER
 
+    print("\n" + "=" * 50)
+    print(f"🚀 Training Model on External Data: {NASA_FILENAME}")
+    print("=" * 50)
 
-class HourRequest(DayRequest):
-    hour: int  # 0-23
+    if not os.path.exists(NASA_FILENAME):
+        print(f"FATAL ERROR: The file '{NASA_FILENAME}' was not found.")
+        print("Please ensure the CSV is in the same directory as the script.")
+        return False
 
-
-# ------------------ Utilities ------------------
-def geolocate_place(city: str, state: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Return (lat, lon, timezone) or (None, None, None)."""
-    place_name = f"{city}, {state}, US"
     try:
-        print(f"[geolocate] querying geocoding for: {place_name}")
-        resp = requests.get(
-            GEOCODING_API_URL,
-            params={"name": place_name, "count": 1, "language": "en", "format": "json"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        # Load the NASA dataset
+        nasa_df = pd.read_csv(NASA_FILENAME)
+
+        # Prepare features (X) and target (y)
+        X = nasa_df[["Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)"]]
+        y = nasa_df["Weather Type"]
+
+        # Check for missing values in training columns
+        if X.isnull().any().any() or y.isnull().any():
+            print("Warning: Missing values found in NASA data. Dropping rows with NaN...")
+            combined_df = pd.concat([X, y], axis=1).dropna()
+            X = combined_df[["Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)"]]
+            y = combined_df["Weather Type"]
+
+        if y.nunique() <= 1:
+            print("Error: The NASA CSV does not contain enough unique 'Weather Type' labels for training.")
+            return False
+
+        # Encode the target labels
+        NASA_LABEL_ENCODER = LabelEncoder()
+        y_encoded = NASA_LABEL_ENCODER.fit_transform(y)
+
+        # Train the Random Forest model
+        NASA_MODEL = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+        NASA_MODEL.fit(X, y_encoded)
+
+        print("✅ NASA Model Training Complete!")
+        print(f"   Trained on {len(nasa_df)} records with {y.nunique()} unique weather types.")
+        return True
+
+    except Exception as e:
+        print(f"ERROR during NASA model training: {e}")
+        return False
+
+
+# --- EXISTING FUNCTION: Geolocation (No Change) ---
+def geolocate_place(place_name):
+    print(f"-> Searching for location: {place_name}...")
+    try:
+        response = requests.get(GEOCODING_API_URL,
+                                params={"name": place_name, "count": 1, "language": "en", "format": "json"})
+        response.raise_for_status()
+        data = response.json()
+
         if not data.get("results"):
-            print("[geolocate] no results returned")
+            print("Error: Location not found. Please check spelling or use specific city/country names.")
             return None, None, None
+
         result = data["results"][0]
+
         if result.get("country_code") != "US":
-            print(f"[geolocate] non-US result: {result.get('country_code')}")
+            print(
+                f"Error: Location must be in the USA. Found location in {result.get('country_code', 'an unknown country')}.")
             return None, None, None
-        lat = result.get("latitude")
-        lon = result.get("longitude")
-        tz = result.get("timezone") or "UTC"
-        print(f"[geolocate] found: lat={lat}, lon={lon}, tz={tz}")
-        return lat, lon, tz
+
+        latitude = result["latitude"]
+        longitude = result["longitude"]
+        timezone = result["timezone"]
+        print(f"-> Found location: {result['name']} ({latitude:.2f}, {longitude:.2f})")
+        return latitude, longitude, timezone
+
     except requests.exceptions.RequestException as e:
-        print(f"[geolocate] request error: {e}")
+        print(f"Error during geolocation API call: {e}")
         return None, None, None
 
 
-def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str, timezone: str) -> Optional[dict]:
+# --- EXISTING FUNCTION: Fetch Weather Data (No Change) ---
+def fetch_weather_data(lat, lon, start_date, end_date, timezone):
+    print(f"-> Fetching historical data from {start_date} to {end_date}...")
+
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -129,73 +120,42 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str, t
         "hourly": ",".join(HOURLY_VARIABLES),
         "timezone": timezone
     }
+
     try:
-        print(f"[fetch] archive API: {start_date} -> {end_date} tz={timezone}")
-        resp = requests.get(ARCHIVE_API_URL, params=params, timeout=60)
-        resp.raise_for_status()
-        return resp.json()
+        response = requests.get(ARCHIVE_API_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
+        return data
+
     except requests.exceptions.RequestException as e:
-        print(f"[fetch] request error: {e}")
+        print(f"Error during weather API call: {e}")
+        print("Tip: Check if your date range is too long or if the API URL is correct.")
         return None
 
 
-def predict_hour(analysis_data: pd.Series) -> str:
-    """Predict weather type using the globally trained Random Forest model"""
-    if not GLOBAL_MODEL_READY:
-        return "Model Error"
-
-    # The global model was trained on these specific column names:
-    required_cols_trained = TRAINING_FEATURES
-
-    # We use the mean values from the API historical data as input features for the model
-    # The data keys here are the same as the trained columns, ensuring correct feature mapping.
-    input_df = pd.DataFrame([[
-        analysis_data.get('Temperature (°C)', 0.0),
-        analysis_data.get('Wind Speed (km/h)', 0.0),
-        analysis_data.get('Precipitation (mm/h)', 0.0)
-    ]], columns=required_cols_trained)
-
-    try:
-        pred = GLOBAL_RF_MODEL.predict(input_df)[0]
-        return GLOBAL_LABEL_ENCODER.inverse_transform([pred])[0]
-    except Exception as e:
-        print(f"[predict_hour] prediction error: {e}")
-        return "Prediction Failed"
+# --- DEPRECATED FUNCTION: No longer needed as we use NASA labels ---
+def synthesize_weather_type(df):
+    """Placeholder to indicate this function is skipped in the new logic."""
+    print("Skipping synthetic labeling: Using pre-trained NASA model labels.")
+    return df
 
 
-def get_day_predictions(city: str, state: str, date_str: str) -> Tuple[List[dict], str]:
-    """Get predictions for all 24 hours of a given day"""
-    if not GLOBAL_MODEL_READY:
-        raise HTTPException(status_code=500,
-                            detail="ML Model is not trained due to missing/invalid NasaWeatherPred.csv.")
+# --- MODIFIED FUNCTION: Uses the globally trained NASA model ---
+def process_and_save(weather_data, location_name, target_hour, upcoming_date_str):
+    global NASA_MODEL, NASA_LABEL_ENCODER
 
-    try:
-        upcoming_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    if not weather_data or "hourly" not in weather_data:
+        print("Error: No valid hourly data received.")
+        return
 
-    historical_end = min(upcoming_date - timedelta(days=1), datetime.now().date() - timedelta(days=1))
-    historical_start = historical_end - timedelta(days=365 * 10)
+    if NASA_MODEL is None or NASA_LABEL_ENCODER is None:
+        print("FATAL ERROR: NASA model is not trained. Cannot proceed with prediction.")
+        return
 
-    # Remove older CSVs (as requested)
-    for f in glob.glob("historical_weather_data_*.csv"):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
+    hourly_data = weather_data["hourly"]
+    df = pd.DataFrame(hourly_data)
 
-    lat, lon, tz = geolocate_place(city, state)
-
-    if lat is None:
-        raise HTTPException(status_code=404, detail="Location not found or not in the USA.")
-
-    data = fetch_weather_data(lat, lon, historical_start.strftime('%Y-%m-%d'), historical_end.strftime('%Y-%m-%d'), tz)
-
-    if data is None or "hourly" not in data:
-        raise HTTPException(status_code=502, detail="Failed fetching historical weather data from provider.")
-
-    df = pd.DataFrame(data["hourly"])
-    rename_map = {
+    column_mapping = {
         "time": "Timestamp",
         "temperature_2m": "Temperature (°C)",
         "pressure_msl": "Atmospheric Pressure (hPa)",
@@ -205,190 +165,151 @@ def get_day_predictions(city: str, state: str, date_str: str) -> Tuple[List[dict
         "wind_speed_10m": "Wind Speed (km/h)",
         "precipitation": "Precipitation (mm/h)"
     }
-    df = df.rename(columns=rename_map)
-
-    if "Timestamp" not in df.columns:
-        raise HTTPException(status_code=502, detail="Historical API response missing 'time' values.")
-
+    df = df.rename(columns=column_mapping)
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
 
-    target_month, target_day = upcoming_date.month, upcoming_date.day
-    # Filter the historical data for the month/day combination across 10 years
-    df_day = df[(df['Timestamp'].dt.month == target_month) & (df['Timestamp'].dt.day == target_day)].copy()
+    target_hour = int(target_hour)
 
-    if df_day.empty:
-        raise HTTPException(status_code=404,
-                            detail=f"No historical hourly records found for {target_month:02d}-{target_day:02d}.")
+    upcoming_date = datetime.strptime(upcoming_date_str, '%Y-%m-%d').date()
+    target_month = upcoming_date.month
+    target_day = upcoming_date.day
 
-    predictions: List[dict] = []
-    for hour in range(24):
-        # Filter for the hour window (-1, current, +1)
-        hours_window = [(hour - 1) % 24, hour, (hour + 1) % 24]
-        df_hour_window = df_day[df_day['Timestamp'].dt.hour.isin(hours_window)].copy()
+    # Filter by month and day over the 10 years
+    df_day_month_filtered = df[
+        (df['Timestamp'].dt.month == target_month) &
+        (df['Timestamp'].dt.day == target_day)
+        ]
 
-        if df_hour_window.empty:
-            predictions.append({
-                "hour": hour,
-                "predicted_weather": "Undefined",
-                "temperature": None,
-                "wind_speed": None,
-                "precipitation": None,
-                "pressure": None,
-                "cloud_cover": None,
-                "visibility": None,
-                "humidity": None,
-                "history_count": 0
-            })
-            continue
+    # Filter by the target hour and +/- 1 hour
+    hours_to_keep = [(target_hour + i) % 24 for i in range(-1, 2)]
 
-        # Calculate the 10-year mean features for the hour window (used as prediction input)
-        analysis_data = df_hour_window.drop(columns=['Timestamp']).mean()
-        predicted_weather = predict_hour(analysis_data)
+    df_filtered = df_day_month_filtered[df_day_month_filtered['Timestamp'].dt.hour.isin(hours_to_keep)].copy()
 
-        predictions.append({
-            "hour": hour,
-            "predicted_weather": predicted_weather,
-            "temperature": None if pd.isna(analysis_data.get('Temperature (°C)')) else round(
-                float(analysis_data['Temperature (°C)']), 1),
-            "wind_speed": None if pd.isna(analysis_data.get('Wind Speed (km/h)')) else round(
-                float(analysis_data['Wind Speed (km/h)']), 1),
-            "precipitation": None if pd.isna(analysis_data.get('Precipitation (mm/h)')) else round(
-                float(analysis_data['Precipitation (mm/h)']), 2),
-            "pressure": None if pd.isna(analysis_data.get('Atmospheric Pressure (hPa)')) else round(
-                float(analysis_data['Atmospheric Pressure (hPa)']), 1),
-            "cloud_cover": None if pd.isna(analysis_data.get('Cloud Cover (%)')) else round(
-                float(analysis_data['Cloud Cover (%)']), 1),
-            "visibility": None if pd.isna(analysis_data.get('Visibility (m)')) else round(
-                float(analysis_data['Visibility (m)']), 1),
-            "humidity": None if pd.isna(analysis_data.get('Relative Humidity (%)')) else round(
-                float(analysis_data['Relative Humidity (%)']), 1),
-            "history_count": int(len(df_hour_window))
-        })
+    if df_filtered.empty:
+        print(
+            f"\nWarning: No data found for the specified date ({target_month:02d}-{target_day:02d}) and hour window over 10 years.")
+        return
 
-    # Build summary
-    temps = [p["temperature"] for p in predictions if p["temperature"] is not None]
-    hums = [p["humidity"] for p in predictions if p["humidity"] is not None]
+    # Calculate the 10-year mean (input for the prediction)
+    # This mean is calculated from the Open-Meteo historical data
+    analysis_data = df_filtered.drop(columns=['Timestamp']).mean()
 
-    # Check predictions for rain based on the global model's classes
-    rains = [p for p in predictions if p["predicted_weather"] and any(
-        rain_word in p["predicted_weather"] for rain_word in ["Rain", "Drizzle", "Snow"])]
+    # --- Prediction Logic using NASA Model ---
 
-    avg_temp = (sum(temps) / len(temps)) if temps else None
-    avg_humidity = (sum(hums) / len(hums)) if hums else None
+    # Prepare the mean data for prediction, matching NASA training features
+    input_data = pd.DataFrame(
+        [[analysis_data['Temperature (°C)'], analysis_data['Wind Speed (km/h)'],
+          analysis_data['Precipitation (mm/h)']]],
+        columns=["Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)"]
+    )
 
-    if avg_temp is not None and avg_humidity is not None:
-        summary = f"Expect an average temperature of {avg_temp:.1f}°C with humidity around {avg_humidity:.0f}%. "
-    elif avg_temp is not None:
-        summary = f"Expect an average temperature of {avg_temp:.1f}°C. "
+    # Predict the weather type based on the 10-year average features
+    prediction = NASA_MODEL.predict(input_data)[0]
+    predicted_weather = NASA_LABEL_ENCODER.inverse_transform([prediction])[0]
+
+    # --- Output and Save ---
+
+    print("\n" + "=" * 50)
+    print(f"📊 PREDICTIVE ANALYSIS FOR {location_name} on {upcoming_date_str} at {target_hour:02d}:00:")
+    print("--------------------------------------------------")
+    print(f"🔮 PREDICTED WEATHER (using NASA Model): {predicted_weather}")
+    print("--------------------------------------------------")
+
+    prediction_line = (
+        f"Open-Meteo Expected Features (10-Year Average +/- 1h on {target_month:02d}-{target_day:02d}):\n"
+        f"Temp: {analysis_data['Temperature (°C)']:.1f}°C, "
+        f"Wind Speed: {analysis_data['Wind Speed (km/h)']:.1f}km/h, "
+        f"Precipitation: {analysis_data['Precipitation (mm/h)']:.1f}mm/h, "
+        f"Pressure: {analysis_data['Atmospheric Pressure (hPa)']:.1f}hPa, "
+        f"Cloud Cover: {analysis_data['Cloud Cover (%)']:.0f}%, "
+        f"Visibility: {analysis_data['Visibility (m)']:.0f}m, "
+        f"Humidity: {analysis_data['Relative Humidity (%)']:.0f}%"
+    )
+    print(prediction_line)
+    print("=" * 50)
+
+    # Save the Open-Meteo historical data (without synthetic label, as it's not used)
+    df_final = df_filtered.copy()  # Use the full filtered data for saving
+
+    # Save a column with the 10-year average for easy reference in the CSV
+    for col in analysis_data.index:
+        df_final[f'10_Year_Avg_{col}'] = analysis_data[col]
+
+    safe_location = "".join(c for c in location_name if c.isalnum() or c in (' ', '_')).rstrip().replace(' ', '_')
+    filename = f"open_meteo_historical_data_{safe_location}.csv"
+
+    # Limit to max rows for saving
+    max_rows = 1000
+    if len(df_final) > max_rows:
+        df_final = df_final.sample(n=max_rows, random_state=42)
+        print(f"Data was sampled down to {max_rows} rows from {len(df_filtered)} historical hourly entries for saving.")
     else:
-        summary = "Insufficient historical data to compute averages. "
+        print(f"Data contains {len(df_final)} entries (no sampling required for saving).")
 
-    summary += f"Rain likely in {len(rains)} hour(s) of the day." if len(
-        rains) > 0 else "No rain is expected based on historical averages."
-
-    return predictions, summary
-
-
-# ------------------ API Endpoints ------------------
-@app.get("/")
-def root():
-    return {
-        "service": "weather-ai-backend",
-        "version": "1.0",
-        "status": "running",
-        "model_status": "Ready" if GLOBAL_MODEL_READY else "Error",
-        "endpoints": {
-            "/predict": "POST - Single hour prediction",
-            "/predict_day": "POST - Full day (24h) prediction",
-            "/health": "GET - Health check"
-        }
-    }
+    df_final.to_csv(filename, index=False)
+    print(f"\nSUCCESS! Sampled Open-Meteo historical data (with 10-year averages) saved to {filename}")
+    print(f"Sample data head:\n{df_final.head().to_string(index=False)}")
+    print("=" * 50)
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+# --- MODIFIED MAIN FUNCTION: Includes NASA Model Training ---
+def main():
+    # 1. Train the NASA model first
+    if not train_nasa_model():
+        print("\nExiting program because the NASA model could not be trained.")
+        return
 
-
-@app.post("/predict_day")
-def predict_day(req: DayRequest, request: Request):
-    """Predict weather for all 24 hours of a given day"""
-    print(
-        f"[predict_day] request from {request.client.host if request.client else 'unknown'} -> {req.city}, {req.state}, {req.date}")
+    # 2. Get user input for location and date
+    location_name = input("\nEnter the place name (MUST be in the USA, e.g., 'New York City', 'Chicago'): ").strip()
+    upcoming_date_str = input("Enter the UPCOMING date (YYYY-MM-DD): ").strip()
+    target_hour = input("Enter the TARGET hour for prediction (0-23, e.g., 14 for 2 PM): ").strip()
 
     try:
-        preds, summary = get_day_predictions(req.city, req.state, req.date)
-        return {
-            "city": req.city,
-            "state": req.state,
-            "date": req.date,
-            "predictions": preds,
-            "summary": summary
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[predict_day] unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        upcoming_date = datetime.strptime(upcoming_date_str, '%Y-%m-%d').date()
+        target_hour = int(target_hour)
+        if not (0 <= target_hour <= 23):
+            raise ValueError("Hour must be between 0 and 23.")
+    except ValueError as e:
+        print(f"\nError: Invalid input format. Check your date (YYYY-MM-DD) or hour (0-23). Details: {e}")
+        return
+
+    # 3. Define historical date range (10 years up to the day before the prediction)
+    requested_historical_end_date = upcoming_date - timedelta(days=1)
+    latest_available_date = datetime.now().date() - timedelta(days=1)
+
+    if requested_historical_end_date > latest_available_date:
+        print(
+            f"\nAPI Data Warning: Your requested date is too far in the future. Data will be fetched up to {latest_available_date} instead.")
+        historical_end_date = latest_available_date
+    else:
+        historical_end_date = requested_historical_end_date
+
+    historical_start_date = historical_end_date - timedelta(days=365 * 10)
+
+    start_date_str = historical_start_date.strftime('%Y-%m-%d')
+    end_date_str = historical_end_date.strftime('%Y-%m-%d')
+
+    # 4. Clean up old Open-Meteo files
+    files_to_delete = glob.glob("open_meteo_historical_data_*.csv")
+    for file_to_delete in files_to_delete:
+        try:
+            os.remove(file_to_delete)
+            print(f"\nSuccessfully deleted old file: {file_to_delete}")
+        except OSError as e:
+            print(f"Error deleting file {file_to_delete}: {e}")
+
+    # 5. Geolocation and Data Fetch
+    latitude, longitude, timezone = geolocate_place(location_name)
+    if latitude is None:
+        return
+
+    data = fetch_weather_data(latitude, longitude, start_date_str, end_date_str, timezone)
+    if data is None:
+        return
+
+    # 6. Process and Predict using the NASA model
+    process_and_save(data, location_name, target_hour, upcoming_date_str)
 
 
-@app.post("/predict")
-def predict(req: HourRequest, request: Request):
-    """Predict weather for a specific hour"""
-    print(
-        f"[predict] request from {request.client.host if request.client else 'unknown'} -> {req.city}, {req.state}, {req.date} @ {req.hour}")
-
-    if not (0 <= req.hour <= 23):
-        raise HTTPException(status_code=400, detail="Hour must be 0-23.")
-
-    try:
-        preds, summary = get_day_predictions(req.city, req.state, req.date)
-        hour_obj = next((p for p in preds if p["hour"] == req.hour), None)
-
-        if hour_obj is None:
-            raise HTTPException(status_code=404, detail="Prediction for requested hour not available.")
-
-        # Simple confidence metric based on history count
-        history_count = hour_obj.get("history_count", 0)
-        conf = max(0.25, min(0.98, 0.25 + 0.007 * min(history_count, 100)))
-
-        return {
-            "city": req.city,
-            "state": req.state,
-            "date": req.date,
-            "prediction": hour_obj,
-            "confidence": round(conf, 2),
-            "summary": summary
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[predict] unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
-# ------------------ CRITICAL: Run Server ------------------
 if __name__ == "__main__":
-    print("\n" + "=" * 70)
-    print("🌦️  WEATHER AI BACKEND SERVER STARTING...")
-    print("=" * 70)
-    print("📡 Server will be available at:")
-    print("    • http://127.0.0.1:8000")
-    print("    • http://localhost:8000")
-    print("\n📚 API Documentation:")
-    print("    • Swagger UI: http://127.0.0.1:8000/docs")
-    print("    • ReDoc: http://127.0.0.1:8000/redoc")
-    print("\n💡 Press CTRL+C to stop the server")
-    print("=" * 70 + "\n")
-
-    try:
-        import uvicorn
-
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-    except ImportError:
-        print("❌ ERROR: uvicorn is not installed!")
-        print("    Run: pip install uvicorn")
-    except KeyboardInterrupt:
-        print("\n\n👋 Server stopped by user")
-    except Exception as e:
-        print(f"\n❌ ERROR: {e}")
+    main()
