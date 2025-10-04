@@ -1,13 +1,20 @@
+# main.py - Weather AI Backend
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import os
-import random
-import glob  # Added for finding files to delete
-from sklearn.model_selection import train_test_split
+import glob
+from typing import Tuple, List, Dict, Any, Optional
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
+import warnings
+warnings.filterwarnings('ignore')
 
+# ------------------ Config ------------------
 GEOCODING_API_URL = "https://geocoding-api.open-meteo.com/v1/search"
 ARCHIVE_API_URL = "https://archive-api.open-meteo.com/v1/archive"
 
@@ -21,40 +28,57 @@ HOURLY_VARIABLES = [
     "precipitation"
 ]
 
+# ------------------ FastAPI ------------------
+app = FastAPI(title="Weather-AI Backend", version="1.0")
 
-def geolocate_place(place_name):
-    print(f"-> Searching for location: {place_name}...")
+# Enhanced CORS for local development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------ Request Schemas ------------------
+class DayRequest(BaseModel):
+    city: str
+    state: str
+    date: str  # YYYY-MM-DD
+
+class HourRequest(DayRequest):
+    hour: int  # 0-23
+
+# ------------------ Utilities ------------------
+def geolocate_place(city: str, state: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Return (lat, lon, timezone) or (None, None, None)."""
+    place_name = f"{city}, {state}, US"
     try:
-        response = requests.get(GEOCODING_API_URL,
-                                params={"name": place_name, "count": 1, "language": "en", "format": "json"})
-        response.raise_for_status()
-        data = response.json()
-
+        print(f"[geolocate] querying geocoding for: {place_name}")
+        resp = requests.get(
+            GEOCODING_API_URL,
+            params={"name": place_name, "count": 1, "language": "en", "format": "json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
         if not data.get("results"):
-            print("Error: Location not found. Please check spelling or use specific city/country names.")
+            print("[geolocate] no results returned")
             return None, None, None
-
         result = data["results"][0]
-
         if result.get("country_code") != "US":
-            print(
-                f"Error: Location must be in the USA. Found location in {result.get('country_code', 'an unknown country')}.")
+            print(f"[geolocate] non-US result: {result.get('country_code')}")
             return None, None, None
-
-        latitude = result["latitude"]
-        longitude = result["longitude"]
-        timezone = result["timezone"]
-        print(f"-> Found location: {result['name']} ({latitude:.2f}, {longitude:.2f})")
-        return latitude, longitude, timezone
-
+        lat = result.get("latitude")
+        lon = result.get("longitude")
+        tz = result.get("timezone") or "UTC"
+        print(f"[geolocate] found: lat={lat}, lon={lon}, tz={tz}")
+        return lat, lon, tz
     except requests.exceptions.RequestException as e:
-        print(f"Error during geolocation API call: {e}")
+        print(f"[geolocate] request error: {e}")
         return None, None, None
 
-
-def fetch_weather_data(lat, lon, start_date, end_date, timezone):
-    print(f"-> Fetching historical data from {start_date} to {end_date}...")
-
+def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str, timezone: str) -> Optional[dict]:
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -63,46 +87,96 @@ def fetch_weather_data(lat, lon, start_date, end_date, timezone):
         "hourly": ",".join(HOURLY_VARIABLES),
         "timezone": timezone
     }
-
     try:
-        response = requests.get(ARCHIVE_API_URL, params=params)
-        response.raise_for_status()
-        data = response.json()
-        return data
-
+        print(f"[fetch] archive API: {start_date} -> {end_date} tz={timezone}")
+        resp = requests.get(ARCHIVE_API_URL, params=params, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
     except requests.exceptions.RequestException as e:
-        print(f"Error during weather API call: {e}")
-        print("Tip: Check if your date range is too long or if the API URL is correct.")
+        print(f"[fetch] request error: {e}")
         return None
 
-
-def synthesize_weather_type(df):
-    # Synthetically create a 'Weather Type' label for training the model
-    # Rule 1: Heavy Rain/Snow (precipitation > 1.0 mm/h)
+def synthesize_weather_type(df: pd.DataFrame) -> pd.DataFrame:
+    """Synthesize weather type based on conditions"""
+    df = df.copy()
+    df['Weather Type'] = None
+    
     df.loc[df['Precipitation (mm/h)'] > 1.0, 'Weather Type'] = 'Heavy Rain/Snow'
-    # Rule 2: Light Rain/Drizzle (0.1 < precipitation <= 1.0 mm/h)
-    df.loc[
-        (df['Precipitation (mm/h)'] > 0.1) & (df['Precipitation (mm/h)'] <= 1.0), 'Weather Type'] = 'Light Rain/Drizzle'
-    # Rule 3: Overcast (cloudcover >= 75%) and no rain
+    df.loc[(df['Precipitation (mm/h)'] > 0.1) & (df['Precipitation (mm/h)'] <= 1.0), 'Weather Type'] = 'Light Rain/Drizzle'
     df.loc[(df['Cloud Cover (%)'] >= 75) & (df['Precipitation (mm/h)'] <= 0.1), 'Weather Type'] = 'Overcast'
-    # Rule 4: Partly Cloudy (30% <= cloudcover < 75%) and no rain
-    df.loc[(df['Cloud Cover (%)'] >= 30) & (df['Cloud Cover (%)'] < 75) & (
-                df['Precipitation (mm/h)'] <= 0.1), 'Weather Type'] = 'Partly Cloudy'
-    # Rule 5: Clear/Sunny (cloudcover < 30%) and no rain (fill remaining)
+    df.loc[(df['Cloud Cover (%)'] >= 30) & (df['Cloud Cover (%)'] < 75) & (df['Precipitation (mm/h)'] <= 0.1), 'Weather Type'] = 'Partly Cloudy'
     df.loc[df['Weather Type'].isna(), 'Weather Type'] = 'Clear/Sunny'
-
+    
     return df
 
+def predict_hour(df_filtered: pd.DataFrame, analysis_data: pd.Series) -> str:
+    """Predict weather type using Random Forest"""
+    if df_filtered.shape[0] < 1:
+        return "Undefined"
+    
+    required_cols = ["Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)"]
+    if not all(c in df_filtered.columns for c in required_cols):
+        return "Undefined"
+    
+    X = df_filtered[required_cols]
+    y = df_filtered["Weather Type"]
+    
+    if y.nunique() <= 1:
+        return y.iloc[0] if not y.empty else "Undefined"
+    
+    try:
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y)
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X, y_enc)
+        
+        input_df = pd.DataFrame([[
+            analysis_data.get('Temperature (°C)', 0.0),
+            analysis_data.get('Wind Speed (km/h)', 0.0),
+            analysis_data.get('Precipitation (mm/h)', 0.0)
+        ]], columns=required_cols)
+        
+        pred = model.predict(input_df)[0]
+        return le.inverse_transform([pred])[0]
+    except Exception as e:
+        print(f"[predict_hour] error: {e}")
+        return "Undefined"
 
-def process_and_save(weather_data, location_name, target_hour, upcoming_date_str):
-    if not weather_data or "hourly" not in weather_data:
-        print("Error: No valid hourly data received.")
-        return
+def get_day_predictions(city: str, state: str, date_str: str) -> Tuple[List[dict], str]:
+    """Get predictions for all 24 hours of a given day"""
+    print("inside get_day_predictions")
+    
+    try:
+        upcoming_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    hourly_data = weather_data["hourly"]
-    df = pd.DataFrame(hourly_data)
+    historical_end = min(upcoming_date - timedelta(days=1), datetime.now().date() - timedelta(days=1))
+    historical_start = historical_end - timedelta(days=365 * 10)
+    
+    # Remove older CSVs
+    for f in glob.glob("historical_weather_data_*.csv"):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
 
-    column_mapping = {
+    lat, lon, tz = geolocate_place(city, state)
+    print(f"[get_day_predictions] geolocated to lat={lat}, lon={lon}, tz={tz}")
+    
+    if lat is None:
+        raise HTTPException(status_code=404, detail="Location not found or not in the USA.")
+
+    data = fetch_weather_data(lat, lon, historical_start.strftime('%Y-%m-%d'), historical_end.strftime('%Y-%m-%d'), tz)
+    print(f"[get_day_predictions] fetched historical data from {historical_start} to {historical_end}")
+    
+    if data is None:
+        raise HTTPException(status_code=502, detail="Failed fetching historical weather data from provider.")
+    if "hourly" not in data:
+        raise HTTPException(status_code=502, detail="Historical API response missing hourly data.")
+
+    df = pd.DataFrame(data["hourly"])
+    rename_map = {
         "time": "Timestamp",
         "temperature_2m": "Temperature (°C)",
         "pressure_msl": "Atmospheric Pressure (hPa)",
@@ -112,154 +186,167 @@ def process_and_save(weather_data, location_name, target_hour, upcoming_date_str
         "wind_speed_10m": "Wind Speed (km/h)",
         "precipitation": "Precipitation (mm/h)"
     }
-    df = df.rename(columns=column_mapping)
+    df = df.rename(columns=rename_map)
+    
+    if "Timestamp" not in df.columns:
+        raise HTTPException(status_code=502, detail="Historical API response missing 'time' values.")
+    
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
 
-    target_hour = int(target_hour)
+    target_month, target_day = upcoming_date.month, upcoming_date.day
+    df_day = df[(df['Timestamp'].dt.month == target_month) & (df['Timestamp'].dt.day == target_day)].copy()
+    
+    if df_day.empty:
+        raise HTTPException(status_code=404, detail=f"No historical hourly records found for {target_month:02d}-{target_day:02d}.")
 
-    upcoming_date = datetime.strptime(upcoming_date_str, '%Y-%m-%d').date()
-    target_month = upcoming_date.month
-    target_day = upcoming_date.day
+    predictions: List[dict] = []
+    for hour in range(24):
+        hours_window = [(hour - 1) % 24, hour, (hour + 1) % 24]
+        df_hour_window = df_day[df_day['Timestamp'].dt.hour.isin(hours_window)].copy()
+        
+        if df_hour_window.empty:
+            predictions.append({
+                "hour": hour,
+                "predicted_weather": "Undefined",
+                "temperature": None,
+                "wind_speed": None,
+                "precipitation": None,
+                "pressure": None,
+                "cloud_cover": None,
+                "visibility": None,
+                "humidity": None,
+                "history_count": 0
+            })
+            continue
 
-    df_day_month_filtered = df[
-        (df['Timestamp'].dt.month == target_month) &
-        (df['Timestamp'].dt.day == target_day)
-        ]
+        df_hour_window = synthesize_weather_type(df_hour_window)
+        analysis_data = df_hour_window.drop(columns=['Timestamp', 'Weather Type']).mean()
+        predicted_weather = predict_hour(df_hour_window, analysis_data)
 
-    hours_to_keep = [(target_hour + i) % 24 for i in range(-1, 2)]
+        predictions.append({
+            "hour": hour,
+            "predicted_weather": predicted_weather,
+            "temperature": None if pd.isna(analysis_data.get('Temperature (°C)')) else round(float(analysis_data['Temperature (°C)']), 1),
+            "wind_speed": None if pd.isna(analysis_data.get('Wind Speed (km/h)')) else round(float(analysis_data['Wind Speed (km/h)']), 1),
+            "precipitation": None if pd.isna(analysis_data.get('Precipitation (mm/h)')) else round(float(analysis_data['Precipitation (mm/h)']), 2),
+            "pressure": None if pd.isna(analysis_data.get('Atmospheric Pressure (hPa)')) else round(float(analysis_data['Atmospheric Pressure (hPa)']), 1),
+            "cloud_cover": None if pd.isna(analysis_data.get('Cloud Cover (%)')) else round(float(analysis_data['Cloud Cover (%)']), 1),
+            "visibility": None if pd.isna(analysis_data.get('Visibility (m)')) else round(float(analysis_data['Visibility (m)']), 1),
+            "humidity": None if pd.isna(analysis_data.get('Relative Humidity (%)')) else round(float(analysis_data['Relative Humidity (%)']), 1),
+            "history_count": int(len(df_hour_window))
+        })
 
-    df_filtered = df_day_month_filtered[df_day_month_filtered['Timestamp'].dt.hour.isin(hours_to_keep)].copy()
+    # Build summary
+    temps = [p["temperature"] for p in predictions if p["temperature"] is not None]
+    hums = [p["humidity"] for p in predictions if p["humidity"] is not None]
+    rains = [p for p in predictions if p["predicted_weather"] and "Rain" in p["predicted_weather"]]
 
-    if df_filtered.empty:
-        print(
-            f"\nWarning: No data found for the specified date ({target_month:02d}-{target_day:02d}) and hour window over 10 years.")
-        return
+    avg_temp = (sum(temps) / len(temps)) if temps else None
+    avg_humidity = (sum(hums) / len(hums)) if hums else None
 
-    df_filtered = synthesize_weather_type(df_filtered)
-
-    # Calculate the 10-year mean (input for the prediction)
-    analysis_data = df_filtered.drop(columns=['Timestamp', 'Weather Type']).mean()
-
-    # --- Machine Learning Prediction Logic ---
-    X = df_filtered[["Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)"]]
-    y = df_filtered["Weather Type"]
-
-    if y.nunique() <= 1:
-        predicted_weather = y.iloc[0] if not y.empty else "Undefined"
-        print(
-            "Warning: Only one 'Weather Type' found in historical data. Skipping ML training and using the only available type.")
+    if avg_temp is not None and avg_humidity is not None:
+        summary = f"Expect an average temperature of {avg_temp:.1f}°C with humidity around {avg_humidity:.0f}%. "
+    elif avg_temp is not None:
+        summary = f"Expect an average temperature of {avg_temp:.1f}°C. "
     else:
-        # Encode the target labels
-        label_encoder = LabelEncoder()
-        y_encoded = label_encoder.fit_transform(y)
+        summary = "Insufficient historical data to compute averages. "
 
-        # Train the model using all filtered historical data
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X, y_encoded)
+    summary += f"Rain likely in {len(rains)} hour(s) of the day." if len(rains) > 0 else "No rain is expected based on historical averages."
 
-        # Prepare the mean data for prediction
-        input_data = pd.DataFrame(
-            [[analysis_data['Temperature (°C)'], analysis_data['Wind Speed (km/h)'],
-              analysis_data['Precipitation (mm/h)']]],
-            columns=["Temperature (°C)", "Wind Speed (km/h)", "Precipitation (mm/h)"]
-        )
+    return predictions, summary
 
-        # Predict the weather type based on the 10-year average features
-        prediction = model.predict(input_data)[0]
-        predicted_weather = label_encoder.inverse_transform([prediction])[0]
+# ------------------ API Endpoints ------------------
+@app.get("/")
+def root():
+    return {
+        "service": "weather-ai-backend",
+        "version": "1.0",
+        "status": "running",
+        "endpoints": {
+            "/predict": "POST - Single hour prediction",
+            "/predict_day": "POST - Full day (24h) prediction",
+            "/health": "GET - Health check"
+        }
+    }
 
-    # --- Output and Save ---
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
-    print("\n" + "=" * 50)
-    print(f"PREDICTIVE ANALYSIS FOR {location_name} on {upcoming_date_str} at {target_hour:02d}:00:")
-    print("--------------------------------------------------")
-
-    prediction_line = (
-        f"Expected Features (10-Year Average +/- 1h on {target_month:02d}-{target_day:02d}):\n"
-        f"PREDICTED WEATHER: {predicted_weather}\n"
-        f"Temp: {analysis_data['Temperature (°C)']:.1f}°C, "
-        f"Wind Speed: {analysis_data['Wind Speed (km/h)']:.1f}km/h, "
-        f"Precipitation: {analysis_data['Precipitation (mm/h)']:.1f}mm/h, "
-        f"Pressure: {analysis_data['Atmospheric Pressure (hPa)']:.1f}hPa, "
-        f"Cloud Cover: {analysis_data['Cloud Cover (%)']:.0f}%, "
-        f"Visibility: {analysis_data['Visibility (m)']:.0f}m, "
-        f"Humidity: {analysis_data['Relative Humidity (%)']:.0f}%"
-    )
-    print(prediction_line)
-    print("--------------------------------------------------")
-
-    max_rows = 1000
-    if len(df_filtered) > max_rows:
-        df_final = df_filtered.sample(n=max_rows, random_state=42)
-        print(f"Data was sampled down to {max_rows} rows from {len(df_filtered)} historical hourly entries.")
-    else:
-        df_final = df_filtered
-        print(f"Data contains {len(df_final)} entries (no sampling required).")
-
-    safe_location = "".join(c for c in location_name if c.isalnum() or c in (' ', '_')).rstrip().replace(' ', '_')
-    filename = f"historical_weather_data_{safe_location}.csv"
-
-    df_final.to_csv(filename, index=False)
-    print(f"\nSUCCESS! Sampled historical data saved to {filename}")
-    print(f"Sample data head:\n{df_final.head().to_string(index=False)}")
-    print("=" * 50)
-
-
-def main():
-
-    location_name = input("\nEnter the place name (MUST be in the USA, e.g., 'New York City', 'Chicago'): ").strip()
-    upcoming_date_str = input("Enter the UPCOMING date (YYYY-MM-DD): ").strip()
-    target_hour = input("Enter the TARGET hour for prediction (0-23, e.g., 14 for 2 PM): ").strip()
-
+@app.post("/predict_day")
+def predict_day(req: DayRequest, request: Request):
+    print("inside predict_day")
+    """Predict weather for all 24 hours of a given day"""
+    print(f"[predict_day] request from {request.client.host if request.client else 'unknown'} -> {req.city}, {req.state}, {req.date}")
+    
     try:
-        upcoming_date = datetime.strptime(upcoming_date_str, '%Y-%m-%d').date()
-        target_hour = int(target_hour)
-        if not (0 <= target_hour <= 23):
-            raise ValueError("Hour must be between 0 and 23.")
-    except ValueError as e:
-        print(f"\nError: Invalid input format. Check your date (YYYY-MM-DD) or hour (0-23). Details: {e}")
-        return
+        preds, summary = get_day_predictions(req.city, req.state, req.date)
+        return {
+            "city": req.city,
+            "state": req.state,
+            "date": req.date,
+            "predictions": preds,
+            "summary": summary
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[predict_day] unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-    requested_historical_end_date = upcoming_date - timedelta(days=1)
+@app.post("/predict")
+def predict(req: HourRequest, request: Request):
+    """Predict weather for a specific hour"""
+    print(f"[predict] request from {request.client.host if request.client else 'unknown'} -> {req.city}, {req.state}, {req.date} @ {req.hour}")
+    
+    if not (0 <= req.hour <= 23):
+        raise HTTPException(status_code=400, detail="Hour must be 0-23.")
+    
+    try:
+        preds, summary = get_day_predictions(req.city, req.state, req.date)
+        hour_obj = next((p for p in preds if p["hour"] == req.hour), None)
+        
+        if hour_obj is None:
+            raise HTTPException(status_code=404, detail="Prediction for requested hour not available.")
+        
+        history_count = hour_obj.get("history_count", 0)
+        conf = max(0.25, min(0.98, 0.25 + 0.007 * min(history_count, 100)))
+        
+        return {
+            "city": req.city,
+            "state": req.state,
+            "date": req.date,
+            "prediction": hour_obj,
+            "confidence": round(conf, 2),
+            "summary": summary
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[predict] unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-    latest_available_date = datetime.now().date() - timedelta(days=1)
-
-    if requested_historical_end_date > latest_available_date:
-        print(
-            f"\nAPI Data Warning: Your requested date is too far in the future. Data will be fetched up to {latest_available_date} instead.")
-        historical_end_date = latest_available_date
-    else:
-        historical_end_date = requested_historical_end_date
-
-    historical_start_date = historical_end_date - timedelta(days=365 * 10)
-
-    start_date_str = historical_start_date.strftime('%Y-%m-%d')
-    end_date_str = historical_end_date.strftime('%Y-%m-%d')
-
-    # --- NEW FILE DELETION LOGIC ---
-    # Delete any existing historical weather CSV file regardless of its location name
-    files_to_delete = glob.glob("historical_weather_data_*.csv")
-    for file_to_delete in files_to_delete:
-        try:
-            os.remove(file_to_delete)
-            print(f"\nSuccessfully deleted old file: {file_to_delete}")
-        except OSError as e:
-            print(f"Error deleting file {file_to_delete}: {e}")
-    # --- END NEW FILE DELETION LOGIC ---
-
-    safe_location = "".join(c for c in location_name if c.isalnum() or c in (' ', '_')).rstrip().replace(' ', '_')
-    filename = f"historical_weather_data_{safe_location}.csv"  # This filename variable is now only used to name the *new* file
-
-    latitude, longitude, timezone = geolocate_place(location_name)
-    if latitude is None:
-        return
-
-    data = fetch_weather_data(latitude, longitude, start_date_str, end_date_str, timezone)
-    if data is None:
-        return
-
-    process_and_save(data, location_name, target_hour, upcoming_date_str)
-
-
+# ------------------ CRITICAL: Run Server ------------------
 if __name__ == "__main__":
-    main()
+    print("\n" + "="*70)
+    print("🌦️  WEATHER AI BACKEND SERVER STARTING...")
+    print("="*70)
+    print("📡 Server will be available at:")
+    print("   • http://127.0.0.1:8000")
+    print("   • http://localhost:8000")
+    print("\n📚 API Documentation:")
+    print("   • Swagger UI: http://127.0.0.1:8000/docs")
+    print("   • ReDoc: http://127.0.0.1:8000/redoc")
+    print("\n💡 Press CTRL+C to stop the server")
+    print("="*70 + "\n")
+    
+    try:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    except ImportError:
+        print("❌ ERROR: uvicorn is not installed!")
+        print("   Run: pip install uvicorn")
+    except KeyboardInterrupt:
+        print("\n\n👋 Server stopped by user")
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
