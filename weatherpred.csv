@@ -1,4 +1,4 @@
-Temperature,Humidity,Wind Speed,Precipitation (%),Cloud Cover,Atmospheric Pressure,UV Index,Season,Visibility (km),Location,Weather Type
+Temperature,Humidity (%),Wind Speed,Precipitation (%),Cloud Cover,Atmospheric Pressure,UV Index,Season,Visibility (km),Location,Weather Type
 14.0,73,9.5,82.0,partly cloudy,1010.82,2,Winter,3.5,inland,Rainy
 39.0,96,8.5,71.0,partly cloudy,1011.43,7,Spring,10.0,inland,Cloudy
 30.0,64,7.0,16.0,clear,1018.72,5,Spring,5.5,mountain,Sunny
